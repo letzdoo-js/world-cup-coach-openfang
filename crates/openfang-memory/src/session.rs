@@ -314,6 +314,52 @@ impl SessionStore {
         Ok(session)
     }
 
+    /// Append messages to the verbatim archive (`messages_archive` table).
+    ///
+    /// This is the single point of truth for "messages that have been evicted
+    /// from active context". Hooks at all three destructive trim sites
+    /// (`agent_loop::run_agent_loop` safety valve, streaming variant, and
+    /// `SessionStore::append_canonical` text-truncation compaction) call into
+    /// this method *before* dropping messages from the live session.
+    ///
+    /// `source` is a short tag identifying which trim site triggered the
+    /// archive (`"safety_trim"`, `"streaming_trim"`, `"canonical_compaction"`).
+    /// Failures log a warning and return `Ok(())` rather than propagating —
+    /// archiving is best-effort instrumentation, not a critical write path,
+    /// and the agent loop must not be blocked on archive failures.
+    pub fn archive_messages(
+        &self,
+        agent_id: AgentId,
+        source: &str,
+        messages: &[Message],
+    ) -> OpenFangResult<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let agent_id_str = agent_id.0.to_string();
+        let tx = conn
+            .transaction()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        for msg in messages {
+            let blob = rmp_serde::to_vec(msg)
+                .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO messages_archive (agent_id, archived_at, source, message) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![agent_id_str, now, source, blob],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
+
     /// Store an LLM-generated summary, replacing older messages with the summary
     /// and keeping only the specified recent messages.
     ///
@@ -463,8 +509,22 @@ impl SessionStore {
                 }
                 canonical.compacted_summary = Some(full_summary);
                 canonical.compaction_cursor = to_compact;
-                // Trim messages: keep only the recent window
-                canonical.messages = canonical.messages.split_off(to_compact);
+                // Archive verbatim before trimming. compacted_summary is a
+                // lossy text synthesis (200 chars/msg, capped at 4000 total) —
+                // it's enough to give the LLM context but useless for audit
+                // and replay. messages_archive is the lossless mirror.
+                let archived: Vec<Message> =
+                    canonical.messages.drain(..to_compact).collect();
+                if let Err(e) =
+                    self.archive_messages(agent_id, "canonical_compaction", &archived)
+                {
+                    tracing::warn!(
+                        agent_id = %agent_id.0,
+                        archived = archived.len(),
+                        error = %e,
+                        "Failed to archive messages before canonical compaction"
+                    );
+                }
                 canonical.compaction_cursor = 0; // reset cursor since we trimmed
             }
         }
@@ -773,6 +833,171 @@ mod tests {
         let all_text: String = recent.iter().map(|m| m.content.text_content()).collect();
         assert!(all_text.contains("Jaber"));
         assert!(summary.is_none()); // Only 2 messages, no compaction
+    }
+
+    /// Read all archived messages for an agent ordered by seq ASC.
+    /// Helper for the archive tests — bypasses the public API to read raw rows.
+    fn archive_dump(store: &SessionStore, agent_id: AgentId) -> Vec<(String, Message)> {
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, message FROM messages_archive \
+                 WHERE agent_id = ?1 ORDER BY seq ASC",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![agent_id.0.to_string()], |row| {
+            let source: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((source, blob))
+        })
+        .unwrap()
+        .map(|r| {
+            let (source, blob) = r.unwrap();
+            let msg: Message = rmp_serde::from_slice(&blob).unwrap();
+            (source, msg)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn test_archive_messages_basic() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let msgs = vec![
+            Message::user("first"),
+            Message::assistant("second"),
+            Message::user("third"),
+        ];
+        store
+            .archive_messages(agent_id, "safety_trim", &msgs)
+            .unwrap();
+
+        let archived = archive_dump(&store, agent_id);
+        assert_eq!(archived.len(), 3);
+        assert!(archived.iter().all(|(src, _)| src == "safety_trim"));
+        assert_eq!(archived[0].1.content.text_content(), "first");
+        assert_eq!(archived[1].1.content.text_content(), "second");
+        assert_eq!(archived[2].1.content.text_content(), "third");
+    }
+
+    #[test]
+    fn test_archive_messages_empty_is_noop() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        store.archive_messages(agent_id, "safety_trim", &[]).unwrap();
+        assert!(archive_dump(&store, agent_id).is_empty());
+    }
+
+    #[test]
+    fn test_archive_isolates_agents_and_tags_source() {
+        let store = setup();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+        store
+            .archive_messages(agent_a, "safety_trim", &[Message::user("a1")])
+            .unwrap();
+        store
+            .archive_messages(agent_b, "streaming_trim", &[Message::user("b1")])
+            .unwrap();
+        store
+            .archive_messages(agent_a, "canonical_compaction", &[Message::user("a2")])
+            .unwrap();
+
+        let dump_a = archive_dump(&store, agent_a);
+        let dump_b = archive_dump(&store, agent_b);
+
+        assert_eq!(dump_a.len(), 2);
+        assert_eq!(dump_a[0].0, "safety_trim");
+        assert_eq!(dump_a[1].0, "canonical_compaction");
+        assert_eq!(dump_b.len(), 1);
+        assert_eq!(dump_b[0].0, "streaming_trim");
+    }
+
+    #[test]
+    fn test_archive_preserves_tool_use_blocks() {
+        // The compacted_summary path drops tool_use/tool_result entirely
+        // (text_content() ignores non-text blocks). The archive must roundtrip
+        // them — this is the whole point of having a verbatim store.
+        use openfang_types::message::{ContentBlock, MessageContent};
+
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        let tool_use = ContentBlock::ToolUse {
+            id: "toolu_test_1".to_string(),
+            name: "memory_recall".to_string(),
+            input: serde_json::json!({"key": "shared.progress"}),
+            provider_metadata: None,
+        };
+        let mixed_content = MessageContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "Let me check.".to_string(),
+                provider_metadata: None,
+            },
+            tool_use.clone(),
+        ]);
+        let assistant_msg = Message {
+            role: Role::Assistant,
+            content: mixed_content,
+        };
+
+        store
+            .archive_messages(agent_id, "safety_trim", &[assistant_msg])
+            .unwrap();
+
+        let archived = archive_dump(&store, agent_id);
+        assert_eq!(archived.len(), 1);
+        let MessageContent::Blocks(blocks) = &archived[0].1.content else {
+            panic!("expected Blocks content, got {:?}", archived[0].1.content);
+        };
+        assert_eq!(blocks.len(), 2);
+        match &blocks[1] {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                assert_eq!(id, "toolu_test_1");
+                assert_eq!(name, "memory_recall");
+                assert_eq!(input["key"], "shared.progress");
+            }
+            other => panic!("expected ToolUse block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_canonical_compaction_archives_before_drop() {
+        // append_canonical drops messages via drain when over threshold. The
+        // patch must archive the dropped batch verbatim before trimming, so
+        // that the lossy compacted_summary is no longer the only record.
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        // 120 messages, threshold 100 → compaction triggered.
+        let msgs: Vec<Message> = (0..120)
+            .map(|i| Message::user(format!("compact-target-{i}")))
+            .collect();
+        let canonical = store.append_canonical(agent_id, &msgs, Some(100)).unwrap();
+
+        // Sanity: compaction did fire and a summary was produced.
+        assert!(canonical.compacted_summary.is_some());
+        assert!(canonical.messages.len() <= 60);
+
+        // The dropped messages should be in the archive, tagged as
+        // canonical_compaction, in original order.
+        let archived = archive_dump(&store, agent_id);
+        let dropped_count = 120 - canonical.messages.len();
+        assert_eq!(archived.len(), dropped_count);
+        assert!(archived.iter().all(|(src, _)| src == "canonical_compaction"));
+        // First archived message is the oldest user message.
+        assert_eq!(
+            archived[0].1.content.text_content(),
+            "compact-target-0"
+        );
+        // Last archived message immediately precedes the first kept message.
+        let last_archived_idx = dropped_count - 1;
+        assert_eq!(
+            archived[last_archived_idx].1.content.text_content(),
+            format!("compact-target-{}", last_archived_idx)
+        );
     }
 
     #[test]

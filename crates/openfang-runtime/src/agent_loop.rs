@@ -434,7 +434,21 @@ pub async fn run_agent_loop(
             trimming = trim_count,
             "Trimming old messages to prevent context overflow"
         );
-        messages.drain(..trim_count);
+        // Archive verbatim before dropping. The trim is a hard safety valve
+        // (see context_overflow::recover_from_overflow for the layered path);
+        // without an archive these messages would be unrecoverable for audit
+        // and replay. Best-effort — failures log but do not block the loop.
+        let archived: Vec<Message> = messages.drain(..trim_count).collect();
+        if let Err(e) =
+            memory.archive_messages(session.agent_id, "safety_trim", &archived)
+        {
+            warn!(
+                agent = %manifest.name,
+                archived = archived.len(),
+                error = %e,
+                "Failed to archive messages before safety trim"
+            );
+        }
         // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
         // pair across the cut boundary, leaving orphaned blocks that cause the LLM
         // to return empty responses (input_tokens=0).
@@ -1635,7 +1649,19 @@ pub async fn run_agent_loop_streaming(
             trimming = trim_count,
             "Trimming old messages to prevent context overflow (streaming)"
         );
-        messages.drain(..trim_count);
+        // Archive verbatim before dropping (see non-streaming variant above
+        // for rationale). Best-effort — failures log but do not block.
+        let archived: Vec<Message> = messages.drain(..trim_count).collect();
+        if let Err(e) =
+            memory.archive_messages(session.agent_id, "streaming_trim", &archived)
+        {
+            warn!(
+                agent = %manifest.name,
+                archived = archived.len(),
+                error = %e,
+                "Failed to archive messages before streaming safety trim"
+            );
+        }
         // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
         // pair across the cut boundary, leaving orphaned blocks that cause the LLM
         // to return empty responses (input_tokens=0).

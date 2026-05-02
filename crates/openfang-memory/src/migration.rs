@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -298,6 +302,36 @@ fn migrate_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (7, datetime('now'), 'Add paired_devices table for device pairing');
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 9: Add messages_archive table for append-only verbatim message history.
+///
+/// The runtime trims session messages in three places to keep the active LLM
+/// context bounded (`agent_loop::run_agent_loop` safety valve, the streaming
+/// variant, and `SessionStore::append_canonical` text-truncation compaction).
+/// Before v9 those trims were destructive — messages were dropped with no
+/// archive, making audit, replay, and prompt-regression testing impossible.
+/// v9 adds an append-only verbatim store. Each row is a single message; the
+/// `source` column tags which trim site evicted it. The compacted_summary on
+/// canonical_sessions is still populated as the LLM-facing context, but it is
+/// no longer the only record.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS messages_archive (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            archived_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            message BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_archive_agent_time ON messages_archive(agent_id, archived_at);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (9, datetime('now'), 'Add messages_archive for append-only verbatim history');
         ",
     )?;
     Ok(())

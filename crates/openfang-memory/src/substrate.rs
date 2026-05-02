@@ -197,6 +197,17 @@ impl MemorySubstrate {
         self.sessions.save_session(session)
     }
 
+    /// Append messages to the verbatim archive. Best-effort instrumentation —
+    /// see `SessionStore::archive_messages` for the full contract.
+    pub fn archive_messages(
+        &self,
+        agent_id: AgentId,
+        source: &str,
+        messages: &[openfang_types::message::Message],
+    ) -> OpenFangResult<()> {
+        self.sessions.archive_messages(agent_id, source, messages)
+    }
+
     /// Save a session asynchronously — runs the SQLite write in a blocking
     /// thread so the tokio runtime stays responsive.
     pub async fn save_session_async(&self, session: &Session) -> OpenFangResult<()> {
